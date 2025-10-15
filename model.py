@@ -9,22 +9,31 @@ class Layer:
         self.grads = {}
         self.cache = {}
 
-    def forward(self, x):
+    def forward(self, x, is_train=True):
         pass
 
     def backward(self, dy):
         pass
 
 class Embedding(Layer):
-    def __init__(self, words, embedding_dim):
+    def __init__(self, words_to_index, word_to_vec_map):
         super().__init__()
-        self.words = words
-        self.embedding_dim = embedding_dim
+        vocab_size = len(word_to_vec_map) + 1 # 1 for padding
+        self.embedding_dim = next(iter(word_to_vec_map.values())).shape[0]
 
-        rng = np.random.default_rng(25)
-        self.params["W"] = 0.01 * rng.standard_normal(size=(words, embedding_dim))
+        W = np.zeros((vocab_size, self.embedding_dim))
+        rng = np.random.default_rng()
 
-    def forward(self, x):
+        for word, idx in words_to_index.items():
+            vec = word_to_vec_map.get(word)
+            if vec is not None:
+                W[idx, :] = vec
+            else: # missing => random
+                W[idx, :] = 0.01 * rng.standard_normal(self.embedding_dim)
+
+        self.params["W"] = W
+
+    def forward(self, x, is_train=True): # x is index matrix
         self.cache["x"] = x
         return self.params["W"][x]
 
@@ -32,6 +41,7 @@ class Embedding(Layer):
         x = self.cache["x"]
         dW = np.zeros_like(self.params["W"])
         np.add.at(dW, x, dy)
+        dW[0, :] = 0
         self.grads["W"] = dW
         return np.zeros_like(x)
 
@@ -41,7 +51,7 @@ class Dropout(Layer):
         self.dropout_rate = dropout_rate
 
     def forward(self, x, is_train=True):
-        if (not is_train) or self.dropout_rate <= 0.0:
+        if (not is_train) or self.dropout_rate <= 0:
             self.cache["mask"] = None
             return x
 
@@ -58,11 +68,11 @@ class Dense(Layer):
     def __init__(self, input_dim, output_dim):
         super().__init__()
 
-        rng = np.random.default_rng(25)
+        rng = np.random.default_rng()
         self.params["W"] = np.sqrt(2.0 / input_dim) * rng.standard_normal(size=(input_dim, output_dim))
         self.params["b"] = np.zeros((1, output_dim))
 
-    def forward(self, x):
+    def forward(self, x, is_train=True):
         if x.shape[1] != self.params["W"].shape[0]:
             x = x.reshape(x.shape[0], -1)
         self.cache["x"] = x
@@ -80,12 +90,12 @@ class VanilaRecurrent(Layer):
         self.hidden_dim = hidden_dim
         self.return_sequences = return_sequences
 
-        rng = np.random.default_rng(25)
+        rng = np.random.default_rng()
         self.params["W"] = np.sqrt(1.0/(input_dim + hidden_dim)) * rng.standard_normal(size=(input_dim + hidden_dim, hidden_dim))
         self.params["b"] = np.zeros((1, hidden_dim))
 
-    def forward(self, x):
-        batch, words, D = x.shape
+    def forward(self, x, is_train=True):
+        batch, words, _ = x.shape
         weights = self.params["W"]
         bias = self.params["b"]
 
@@ -132,7 +142,7 @@ class VanilaRecurrent(Layer):
 
             dh = dy[:, t, :] + grad_hidden_next
             h_t = np.tanh(z_t)
-            dz = dh * (1.0 - h_t*h_t)                        # tanh’(z)
+            dz = dh * (1.0 - h_t * h_t)
 
             concat = np.concatenate([x_t, h_prev], 1)
             dW += concat.T @ dz
@@ -152,13 +162,13 @@ class LSTM(Layer):
         self.hidden_dim = hidden_dim
         self.return_sequences = return_sequences
 
-        rng = np.random.default_rng(25)
+        rng = np.random.default_rng()
         self.params["W"] = np.sqrt(1.0 / (input_dim + hidden_dim)) * rng.standard_normal(size=(input_dim + hidden_dim, 4 * hidden_dim)
         )
         self.params["b"] = np.zeros((1, 4 * hidden_dim))
 
-    def forward(self, x):
-        batch, words, D = x.shape
+    def forward(self, x, is_train=True):
+        batch, words, _ = x.shape
         weights = self.params["W"]
         bias = self.params["b"]
 
@@ -260,7 +270,7 @@ class ActiveFunc(Layer):
         super().__init__()
 
 class ReLU(ActiveFunc):
-    def forward(self, x):
+    def forward(self, x, is_train=True):
         mask = x > 0
         self.cache["mask"] = mask # for backward
         return x * mask # False entry as 0
@@ -269,7 +279,7 @@ class ReLU(ActiveFunc):
         return dy * self.cache["mask"]
 
 class Tanh(ActiveFunc):
-    def forward(self, x):
+    def forward(self, x, is_train=True):
         output = np.tanh(x)
         self.cache["output"] = output
         return output
@@ -286,6 +296,7 @@ class SoftmaxCrossEntropy: # Combine Softmax and CE => Easy calculation
         exp = np.exp(z)
         probs = exp / exp.sum(axis=1, keepdims=True)
         probs = np.clip(probs, 1e-12, 1.0)
+        
         self.cache["probs"] = probs
         self.cache["y"] = y
 
@@ -308,7 +319,7 @@ class Optimizer:
 
     def zero_grad(self, layers):
         for _, grads in layers:
-            grads[...] = 0.0
+            grads[...] = 0
 
 class SGD(Optimizer):
     def __init__(self, lr=0.01, weight_decay=0.0):
@@ -363,17 +374,20 @@ class Model:
         self.parameters = []
         self.optimizer = optimizer
 
-    def forward(self, x, y):
+    def forward(self, x, y, is_train=True):
         for layer in self.layers:
-            x = layer.forward(x)
+            x = layer.forward(x, is_train)
         return self.evaluate.forward(x, y)
 
     def backward(self):
         grad = self.evaluate.backward()
         for layer in reversed(self.layers):
             grad = layer.backward(grad)
-        
+
         self.vectorize_parameters()
+
+        # for _, grads in self.parameters:
+            # np.clip(grads, -1.0, 1.0, out=grads)
 
         self.optimizer.step(self.parameters)
         self.optimizer.zero_grad(self.parameters)
